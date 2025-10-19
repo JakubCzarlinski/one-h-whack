@@ -9,6 +9,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -73,6 +74,13 @@ type translationMsg struct {
 	translation string
 }
 
+type renameCompleteMsg struct {
+	oldPath string
+	newPath string
+	success bool
+	err     error
+}
+
 type item struct {
 	title       string
 	translation string
@@ -100,11 +108,23 @@ func (i item) Description() string {
 
 func (i item) FilterValue() string { return i.title }
 
+type viewMode int
+
+const (
+	normalMode viewMode = iota
+	confirmRenameMode
+)
+
 type model struct {
-	list        list.Model
-	currentPath string
-	err         error
-	quitting    bool
+	list          list.Model
+	currentPath   string
+	err           error
+	quitting      bool
+	mode          viewMode
+	confirmInput  textinput.Model
+	itemToRename  item
+	proposedName  string
+	statusMessage string
 }
 
 func translateText(text string) (string, error) {
@@ -201,6 +221,18 @@ func translateNameCmd(name string) tea.Cmd {
 	}
 }
 
+func renameFileCmd(oldPath, newPath string) tea.Cmd {
+	return func() tea.Msg {
+		err := os.Rename(oldPath, newPath)
+		return renameCompleteMsg{
+			oldPath: oldPath,
+			newPath: newPath,
+			success: err == nil,
+			err:     err,
+		}
+	}
+}
+
 func getDirectoryItems(path string) ([]list.Item, []tea.Cmd) {
 	entries, err := os.ReadDir(path)
 	if err != nil {
@@ -278,12 +310,22 @@ func initialModel() model {
 				key.WithKeys("right"),
 				key.WithHelp("→", "ouvrir"),
 			),
+			key.NewBinding(
+				key.WithKeys("enter"),
+				key.WithHelp("enter", "renommer"),
+			),
 		}
 	}
 
+	ti := textinput.New()
+	ti.Placeholder = "Nouveau nom..."
+	ti.CharLimit = 255
+
 	return model{
-		list:        l,
-		currentPath: homeDir,
+		list:         l,
+		currentPath:  homeDir,
+		mode:         normalMode,
+		confirmInput: ti,
 	}
 }
 
@@ -300,6 +342,7 @@ func (m model) navigateToDirectory(path string) (model, tea.Cmd) {
 	m.list.Title = fmt.Sprintf("Navigateur de fichiers - %s", m.currentPath)
 	m.list.SetItems(items)
 	m.list.ResetSelected()
+	m.statusMessage = ""
 	return m, tea.Batch(cmds...)
 }
 
@@ -326,7 +369,46 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.list.SetItems(items)
 		return m, nil
 
+	case renameCompleteMsg:
+		m.mode = normalMode
+		if msg.success {
+			m.statusMessage = fmt.Sprintf("✓ Renommé: %s → %s",
+				filepath.Base(msg.oldPath), filepath.Base(msg.newPath))
+			// Refresh directory
+			return m.navigateToDirectory(m.currentPath)
+		} else {
+			m.statusMessage = fmt.Sprintf("✗ Erreur: %v", msg.err)
+			return m, nil
+		}
+
 	case tea.KeyMsg:
+		if m.mode == confirmRenameMode {
+			switch msg.String() {
+			case "esc":
+				m.mode = normalMode
+				m.statusMessage = ""
+				return m, nil
+
+			case "enter":
+				newName := m.confirmInput.Value()
+				if newName == "" {
+					newName = m.proposedName
+				}
+
+				oldPath := m.itemToRename.path
+				newPath := filepath.Join(filepath.Dir(oldPath), newName)
+
+				m.statusMessage = "Renommage en cours..."
+				return m, renameFileCmd(oldPath, newPath)
+
+			default:
+				var cmd tea.Cmd
+				m.confirmInput, cmd = m.confirmInput.Update(msg)
+				return m, cmd
+			}
+		}
+
+		// Normal mode
 		switch msg.String() {
 		case "ctrl+c", "q":
 			m.quitting = true
@@ -341,7 +423,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 
-		case "right", "enter":
+		case "enter":
+			// Show rename confirmation
+			selectedItem, ok := m.list.SelectedItem().(item)
+			if !ok {
+				return m, nil
+			}
+
+			// Get the French translation
+			translation, _ := cache.Get(selectedItem.title)
+			if translation == "" || translation == selectedItem.title {
+				m.statusMessage = "✗ Pas de traduction disponible"
+				return m, nil
+			}
+
+			m.mode = confirmRenameMode
+			m.itemToRename = selectedItem
+			m.proposedName = translation
+			m.confirmInput.SetValue(translation)
+			m.confirmInput.Focus()
+			m.statusMessage = ""
+
+			return m, textinput.Blink
+
+		case "right":
 			// Navigate into directory
 			selectedItem, ok := m.list.SelectedItem().(item)
 			if !ok {
@@ -374,7 +479,44 @@ func (m model) View() string {
 			m.err)
 	}
 
-	return m.list.View()
+	if m.mode == confirmRenameMode {
+		confirmStyle := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("62")).
+			Padding(1, 2).
+			Width(60)
+
+		content := fmt.Sprintf(
+			"Renommer:\n\n"+
+				"  Ancien: %s\n"+
+				"  Nouveau: %s\n\n"+
+				"Modifier le nom:\n%s\n\n"+
+				"[Enter] Confirmer  [Esc] Annuler",
+			m.itemToRename.title,
+			m.proposedName,
+			m.confirmInput.View(),
+		)
+
+		return lipgloss.Place(
+			m.list.Width(),
+			m.list.Height(),
+			lipgloss.Center,
+			lipgloss.Center,
+			confirmStyle.Render(content),
+		)
+	}
+
+	view := m.list.View()
+
+	if m.statusMessage != "" {
+		statusStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("170")).
+			Bold(true).
+			Padding(0, 1)
+		view += "\n" + statusStyle.Render(m.statusMessage)
+	}
+
+	return view
 }
 
 func main() {
