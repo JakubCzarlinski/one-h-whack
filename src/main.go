@@ -186,7 +186,7 @@ func translateText(text string) (string, error) {
 			err = translateErr
 			return
 		}
-		translated = result.Text + ext
+		translated = strings.ReplaceAll(result.Text, " ", "_") + ext
 	}()
 
 	if err != nil {
