@@ -5,24 +5,62 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+
+	gt "gopkg.gilang.dev/google-translate"
+	"gopkg.gilang.dev/google-translate/params"
 )
 
-// Simple translation map for common terms
-var translations = map[string]string{
-	"Desktop":   "Bureau",
-	"Documents": "Documents",
-	"Downloads": "Téléchargements",
-	"Pictures":  "Images",
-	"Music":     "Musique",
-	"Videos":    "Vidéos",
-	"Home":      "Accueil",
-	"Folder":    "Dossier",
-	"File":      "Fichier",
+// Translation cache to avoid repeated API calls
+type translationCache struct {
+	mu    sync.RWMutex
+	cache map[string]string
+}
+
+func (tc *translationCache) Get(key string) (string, bool) {
+	tc.mu.RLock()
+	defer tc.mu.RUnlock()
+	val, ok := tc.cache[key]
+	return val, ok
+}
+
+func (tc *translationCache) Set(key, val string) {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	tc.cache[key] = val
+}
+
+var (
+	// Pre-defined translations for common terms
+	staticTranslations = map[string]string{
+		"Desktop":   "Bureau",
+		"Documents": "Documents",
+		"Downloads": "Téléchargements",
+		"Pictures":  "Images",
+		"Music":     "Musique",
+		"Videos":    "Vidéos",
+		"Home":      "Accueil",
+		"Folder":    "Dossier",
+		"File":      "Fichier",
+		"Public":    "Public",
+		"Templates": "Modèles",
+		"Library":   "Bibliothèque",
+	}
+
+	// Global translation cache and client
+	cache = &translationCache{
+		cache: make(map[string]string),
+	}
+)
+
+type translationMsg struct {
+	name        string
+	translation string
 }
 
 type item struct {
@@ -30,10 +68,26 @@ type item struct {
 	translation string
 	path        string
 	isDir       bool
+	translating bool
 }
 
-func (i item) Title() string       { return i.title }
-func (i item) Description() string { return i.translation }
+func (i item) Title() string {
+	if i.translating {
+		return i.title + " ⏳"
+	}
+	if i.isDir {
+		return i.title + " 📁"
+	}
+	return i.title
+}
+
+func (i item) Description() string {
+	if i.translation == "" {
+		return "Traduction en cours..."
+	}
+	return i.translation
+}
+
 func (i item) FilterValue() string { return i.title }
 
 type model struct {
@@ -43,68 +97,100 @@ type model struct {
 	quitting    bool
 }
 
-func translateName(name string) string {
-	// Check direct translation
-	if trans, ok := translations[name]; ok {
-		return trans
+func translateText(text string) (string, error) {
+	// Check cache first
+	if trans, ok := cache.Get(text); ok {
+		return trans, nil
 	}
 
-	// Try case-insensitive
-	for key, val := range translations {
-		if strings.EqualFold(key, name) {
-			return val
+	// Check static translations
+	if trans, ok := staticTranslations[text]; ok {
+		cache.Set(text, trans)
+		return trans, nil
+	}
+
+	// Case-insensitive check
+	for key, val := range staticTranslations {
+		if strings.EqualFold(key, text) {
+			cache.Set(text, val)
+			return val, nil
 		}
 	}
 
-	// Basic word replacements
-	result := name
-	result = strings.ReplaceAll(result, "file", "fichier")
-	result = strings.ReplaceAll(result, "folder", "dossier")
-	result = strings.ReplaceAll(result, "new", "nouveau")
-	result = strings.ReplaceAll(result, "old", "ancien")
+	// Remove file extensions for better translation
+	nameWithoutExt := strings.TrimSuffix(text, filepath.Ext(text))
+	ext := filepath.Ext(text)
 
-	return result
+	value := params.Translate{
+		Text: nameWithoutExt,
+		From: "en",
+		To:   "fr",
+	}
+	transaltion, err := gt.TranslateWithParam(value)
+	if err != nil {
+		return text, err
+	}
+	translated := transaltion.Text + ext
+	cache.Set(text, translated)
+	return translated, nil
 }
 
-func getDirectoryItems(path string) ([]list.Item, error) {
+func translateNameCmd(name string) tea.Cmd {
+	return func() tea.Msg {
+		translation, err := translateText(name)
+		if err != nil {
+			translation = name // Fallback to original
+		}
+		return translationMsg{
+			name:        name,
+			translation: translation,
+		}
+	}
+}
+
+func getDirectoryItems(path string) ([]list.Item, []tea.Cmd) {
 	entries, err := os.ReadDir(path)
 	if err != nil {
-		return nil, err
+		return nil, nil
 	}
 
 	items := make([]list.Item, 0)
-
-	// Add parent directory option if not at root
-	if path != "/" && path != filepath.Dir(path) {
-		items = append(items, item{
-			title:       "..",
-			translation: "Dossier parent",
-			path:        filepath.Dir(path),
-			isDir:       true,
-		})
-	}
+	cmds := make([]tea.Cmd, 0)
 
 	for _, entry := range entries {
-		// Skip hidden files on Unix-like systems
+		// Skip hidden files
 		if strings.HasPrefix(entry.Name(), ".") {
 			continue
 		}
 
-		translation := translateName(entry.Name())
 		typeStr := "Fichier"
 		if entry.IsDir() {
 			typeStr = "Dossier"
 		}
 
-		items = append(items, item{
+		// Check if translation is cached
+		cached, hasCached := cache.Get(entry.Name())
+
+		newItem := item{
 			title:       entry.Name(),
-			translation: fmt.Sprintf("%s → %s", typeStr, translation),
+			translation: "",
 			path:        filepath.Join(path, entry.Name()),
 			isDir:       entry.IsDir(),
-		})
+			translating: !hasCached,
+		}
+
+		if hasCached {
+			newItem.translation = fmt.Sprintf("%s → %s", typeStr, cached)
+		} else {
+			newItem.translation = fmt.Sprintf("%s → ...", typeStr)
+			// Queue translation
+			cmds = append(cmds, translateNameCmd(entry.Name()))
+		}
+
+		items = append(items, newItem)
 	}
 
-	return items, nil
+	return items, cmds
 }
 
 func initialModel() model {
@@ -113,10 +199,7 @@ func initialModel() model {
 		homeDir = "."
 	}
 
-	items, err := getDirectoryItems(homeDir)
-	if err != nil {
-		items = []list.Item{}
-	}
+	items, _ := getDirectoryItems(homeDir)
 
 	delegate := list.NewDefaultDelegate()
 	delegate.Styles.SelectedTitle = lipgloss.NewStyle().
@@ -135,8 +218,12 @@ func initialModel() model {
 	l.AdditionalShortHelpKeys = func() []key.Binding {
 		return []key.Binding{
 			key.NewBinding(
-				key.WithKeys("enter"),
-				key.WithHelp("enter", "ouvrir"),
+				key.WithKeys("left"),
+				key.WithHelp("←", "parent"),
+			),
+			key.NewBinding(
+				key.WithKeys("right"),
+				key.WithHelp("→", "ouvrir"),
 			),
 		}
 	}
@@ -148,36 +235,68 @@ func initialModel() model {
 }
 
 func (m model) Init() tea.Cmd {
-	return nil
+	// Trigger initial translations
+	items, cmds := getDirectoryItems(m.currentPath)
+	m.list.SetItems(items)
+	return tea.Batch(cmds...)
+}
+
+func (m model) navigateToDirectory(path string) (model, tea.Cmd) {
+	items, cmds := getDirectoryItems(path)
+	m.currentPath = path
+	m.list.Title = fmt.Sprintf("Navigateur de fichiers - %s", m.currentPath)
+	m.list.SetItems(items)
+	m.list.ResetSelected()
+	return m, tea.Batch(cmds...)
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case translationMsg:
+		// Update the item with the translation
+		items := m.list.Items()
+		for i, itm := range items {
+			if listItem, ok := itm.(item); ok {
+				if listItem.title == msg.name {
+					typeStr := "Fichier"
+					if listItem.isDir {
+						typeStr = "Dossier"
+					}
+					listItem.translation = fmt.Sprintf("%s → %s",
+						typeStr, msg.translation)
+					listItem.translating = false
+					items[i] = listItem
+					break
+				}
+			}
+		}
+		m.list.SetItems(items)
+		return m, nil
+
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c", "q":
 			m.quitting = true
 			return m, tea.Quit
 
-		case "enter":
+		case "left":
+			// Navigate to parent directory
+			parentPath := filepath.Dir(m.currentPath)
+			// Prevent going beyond root
+			if parentPath != m.currentPath {
+				return m.navigateToDirectory(parentPath)
+			}
+			return m, nil
+
+		case "right", "enter":
+			// Navigate into directory
 			selectedItem, ok := m.list.SelectedItem().(item)
 			if !ok {
 				return m, nil
 			}
 
 			if selectedItem.isDir {
-				// Navigate into directory
-				items, err := getDirectoryItems(selectedItem.path)
-				if err != nil {
-					m.err = err
-					return m, nil
-				}
-
-				m.currentPath = selectedItem.path
-				m.list.Title = fmt.Sprintf("Navigateur de fichiers - %s",
-					m.currentPath)
-				m.list.SetItems(items)
-				m.list.ResetSelected()
+				return m.navigateToDirectory(selectedItem.path)
 			}
 			return m, nil
 		}
