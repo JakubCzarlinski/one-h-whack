@@ -38,18 +38,28 @@ func (tc *translationCache) Set(key, val string) {
 var (
 	// Pre-defined translations for common terms
 	staticTranslations = map[string]string{
-		"Desktop":   "Bureau",
-		"Documents": "Documents",
-		"Downloads": "Téléchargements",
-		"Pictures":  "Images",
-		"Music":     "Musique",
-		"Videos":    "Vidéos",
-		"Home":      "Accueil",
-		"Folder":    "Dossier",
-		"File":      "Fichier",
-		"Public":    "Public",
-		"Templates": "Modèles",
-		"Library":   "Bibliothèque",
+		"Desktop":      "Bureau",
+		"Documents":    "Documents",
+		"Downloads":    "Téléchargements",
+		"Pictures":     "Images",
+		"Music":        "Musique",
+		"Videos":       "Vidéos",
+		"Home":         "Accueil",
+		"Folder":       "Dossier",
+		"File":         "Fichier",
+		"Public":       "Public",
+		"Templates":    "Modèles",
+		"Library":      "Bibliothèque",
+		"Applications": "Applications",
+		"Movies":       "Films",
+		"bin":          "binaire",
+		"src":          "source",
+		"pkg":          "paquets",
+		"tmp":          "temporaire",
+		"opt":          "optionnel",
+		"usr":          "utilisateur",
+		"var":          "variable",
+		"etc":          "configuration",
 	}
 
 	// Global translation cache and client
@@ -121,18 +131,61 @@ func translateText(text string) (string, error) {
 	nameWithoutExt := strings.TrimSuffix(text, filepath.Ext(text))
 	ext := filepath.Ext(text)
 
-	value := params.Translate{
-		Text: nameWithoutExt,
-		From: "en",
-		To:   "fr",
+	// Skip translation for very short names or single characters
+	if len(nameWithoutExt) <= 1 {
+		cache.Set(text, text)
+		return text, nil
 	}
-	transaltion, err := gt.TranslateWithParam(value)
+
+	// Skip translation for names that are all numbers or special chars
+	if !containsLetters(nameWithoutExt) {
+		cache.Set(text, text)
+		return text, nil
+	}
+
+	// Use defer/recover to catch panics from the translation library
+	var translated string
+	var err error
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				// If translation panics, just use the original text
+				err = fmt.Errorf("translation panic: %v", r)
+			}
+		}()
+
+		value := params.Translate{
+			Text: nameWithoutExt,
+			From: "en",
+			To:   "fr",
+		}
+
+		result, translateErr := gt.TranslateWithParam(value)
+		if translateErr != nil {
+			err = translateErr
+			return
+		}
+		translated = result.Text + ext
+	}()
+
 	if err != nil {
-		return text, err
+		// Fallback to original text on error
+		cache.Set(text, text)
+		return text, nil
 	}
-	translated := transaltion.Text + ext
+
 	cache.Set(text, translated)
 	return translated, nil
+}
+
+func containsLetters(s string) bool {
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+			return true
+		}
+	}
+	return false
 }
 
 func translateNameCmd(name string) tea.Cmd {
